@@ -13,23 +13,14 @@
 #include <dirent.h>
 #include <fat.h>
 
+//from my tests 50us seems to be the lowest
+//safe si transfer delay in between calls
+#define SI_TRANS_DELAY 50
+
 extern u8 goomba_gba[];
 extern u32 goomba_gba_size;
 
 u8 *resbuf,*cmdbuf;
-volatile u16 pads = 0;
-volatile bool ctrlerr = false;
-void ctrlcb(s32 chan, u32 ret)
-{
-	if(ret)
-	{
-		ctrlerr = true;
-		return;
-	}
-	//just call us again
-	pads = (~((resbuf[1]<<8)|resbuf[0]))&0x3FF;
-	SI_Transfer(1,cmdbuf,1,resbuf,5,ctrlcb,350);
-}
 
 volatile u32 transval = 0;
 void transcb(s32 chan, u32 ret)
@@ -99,7 +90,38 @@ unsigned int calckey(unsigned int size)
 	}
 	return ret;
 }
-
+void doreset()
+{
+	cmdbuf[0] = 0xFF; //reset
+	transval = 0;
+	SI_Transfer(1,cmdbuf,1,resbuf,3,transcb,SI_TRANS_DELAY);
+	while(transval == 0) ;
+}
+void getstatus()
+{
+	cmdbuf[0] = 0; //status
+	transval = 0;
+	SI_Transfer(1,cmdbuf,1,resbuf,3,transcb,SI_TRANS_DELAY);
+	while(transval == 0) ;
+}
+u32 recv()
+{
+	memset(resbuf,0,32);
+	cmdbuf[0]=0x14; //read
+	transval = 0;
+	SI_Transfer(1,cmdbuf,1,resbuf,5,transcb,SI_TRANS_DELAY);
+	while(transval == 0) ;
+	return *(vu32*)resbuf;
+}
+void send(u32 msg)
+{
+	cmdbuf[0]=0x15;cmdbuf[1]=(msg>>0)&0xFF;cmdbuf[2]=(msg>>8)&0xFF;
+	cmdbuf[3]=(msg>>16)&0xFF;cmdbuf[4]=(msg>>24)&0xFF;
+	transval = 0;
+	resbuf[0] = 0;
+	SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,SI_TRANS_DELAY);
+	while(transval == 0) ;
+}
 typedef struct _gbNames {
 	char name[256];
 } gbNames;
@@ -161,7 +183,7 @@ int main(int argc, char *argv[])
     }
 	if(gbCnt == 0)
 	{
-		printf("No Files!\n");
+		printf("No Files! Make sure you have .gb/.gbc files in your \"roms\" folder!\n");
 		VIDEO_WaitVSync();
 		VIDEO_WaitVSync();
 		sleep(5);
@@ -176,7 +198,7 @@ int main(int argc, char *argv[])
 		{
 			printf("\x1b[2J");
 			printf("\x1b[37m");
-			printf("GoombaSend v1.0 by FIX94\n");
+			printf("GoombaSend v1.1 by FIX94\n");
 			printf("Select ROM file\n");
 			printf("<< %s >>\n",names[i].name);
 			PAD_ScanPads();
@@ -212,6 +234,9 @@ int main(int argc, char *argv[])
 		rewind(f);
 		if(gbSize+goomba_gba_size > 262144)
 		{
+			printf("ROM too big for GBA RAM!\n");
+			VIDEO_WaitVSync();
+			sleep(2);
 			fclose(f);
 			continue;
 		}
@@ -219,7 +244,6 @@ int main(int argc, char *argv[])
 		fclose(f);
 		printf("Waiting for GBA in port 2...\n");
 		resval = 0;
-		ctrlerr = false;
 
 		SI_GetTypeAsync(1,acb);
 		while(1)
@@ -241,43 +265,23 @@ int main(int argc, char *argv[])
 			resbuf[2]=0;
 			while(!(resbuf[2]&0x10))
 			{
-				cmdbuf[0] = 0xFF; //reset
-				transval = 0;
-				SI_Transfer(1,cmdbuf,1,resbuf,3,transcb,0);
-				wait_for_transfer();
-				cmdbuf[0] = 0; //status
-				transval = 0;
-				SI_Transfer(1,cmdbuf,1,resbuf,3,transcb,0);
-				wait_for_transfer();
+				doreset();
+				getstatus();
 			}
-			printf("GBA Ready!\n");
+			printf("GBA Ready, sending Goomba\n");
 			unsigned int sendsize = (((goomba_gba_size+gbSize)+7)&~7);
 			unsigned int ourkey = calckey(sendsize);
-			printf("Our Key: %08x\n", ourkey);
+			//printf("Our Key: %08x\n", ourkey);
 			//get current sessionkey
-			memset(resbuf,0,32);
-			cmdbuf[0]=0x14; //read
-			transval = 0;
-			SI_Transfer(1,cmdbuf,1,resbuf,5,transcb,0);
-			wait_for_transfer();
-			u32 sessionkey = (resbuf[3]^0x6F)<<24|(resbuf[2]^0x64)<<16|(resbuf[1]^0x65)<<8|(resbuf[0]^0x73);
+			u32 sessionkeyraw = recv();
+			u32 sessionkey = __builtin_bswap32(sessionkeyraw^0x7365646F);
 			//send over our own key
-			cmdbuf[0]=0x15;cmdbuf[1]=(ourkey>>24)&0xFF;cmdbuf[2]=(ourkey>>16)&0xFF;cmdbuf[3]=(ourkey>>8)&0xFF;cmdbuf[4]=ourkey&0xFF;
-			transval = 0;
-			SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-			wait_for_transfer();
+			send(__builtin_bswap32(ourkey));
 			unsigned int fcrc = 0x15a0;
 			//send over gba header
 			for(i = 0; i < 0xC0; i+=4)
-			{
-				cmdbuf[0]=0x15;cmdbuf[1]=goomba_gba[i];cmdbuf[2]=goomba_gba[i+1];cmdbuf[3]=goomba_gba[i+2];cmdbuf[4]=goomba_gba[i+3];
-				transval = 0;
-				resbuf[0] = 0;
-				SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-				wait_for_transfer();
-				if(!(resbuf[0]&0x2)) printf("Possible error %02x\n",resbuf[0]);
-			}
-			printf("Header done! Sending Goomba...\n");
+				send(__builtin_bswap32(*(vu32*)(goomba_gba+i)));
+			//printf("Header done! Sending Goomba...\n");
 			for(i = 0xC0; i < goomba_gba_size; i+=4)
 			{
 				u32 enc = ((goomba_gba[i+3]<<24)|(goomba_gba[i+2]<<16)|(goomba_gba[i+1]<<8)|(goomba_gba[i]));
@@ -286,12 +290,7 @@ int main(int argc, char *argv[])
 				enc^=sessionkey;
 				enc^=((~(i+(0x20<<20)))+1);
 				enc^=0x20796220;
-				cmdbuf[0]=0x15;cmdbuf[1]=(enc>>0)&0xFF;cmdbuf[2]=(enc>>8)&0xFF;cmdbuf[3]=(enc>>16)&0xFF;cmdbuf[4]=(enc>>24)&0xFF;
-				transval = 0;
-				resbuf[0] = 0;
-				SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-				wait_for_transfer();
-				if(!(resbuf[0]&0x2)) printf("Possible error %02x\n",resbuf[0]);
+				send(enc);
 			}
 			printf("Goomba done! Sending ROM...\n");
 			for(i = goomba_gba_size; i < sendsize; i+=4)
@@ -303,31 +302,18 @@ int main(int argc, char *argv[])
 				enc^=sessionkey;
 				enc^=((~(i+(0x20<<20)))+1);
 				enc^=0x20796220;
-				cmdbuf[0]=0x15;cmdbuf[1]=(enc>>0)&0xFF;cmdbuf[2]=(enc>>8)&0xFF;cmdbuf[3]=(enc>>16)&0xFF;cmdbuf[4]=(enc>>24)&0xFF;
-				transval = 0;
-				resbuf[0] = 0;
-				SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-				wait_for_transfer();
-				if(!(resbuf[0]&0x2)) printf("Possible error %02x\n",resbuf[0]);
+				send(enc);
 			}
 			fcrc |= (sendsize<<16);
-			printf("ROM done! CRC: %08x\n", fcrc);
+			//printf("ROM done! CRC: %08x\n", fcrc);
 			//send over CRC
 			sessionkey = (sessionkey*0x6177614B)+1;
 			fcrc^=sessionkey;
 			fcrc^=((~(i+(0x20<<20)))+1);
 			fcrc^=0x20796220;
-			cmdbuf[0]=0x15;cmdbuf[1]=(fcrc>>0)&0xFF;cmdbuf[2]=(fcrc>>8)&0xFF;cmdbuf[3]=(fcrc>>16)&0xFF;cmdbuf[4]=(fcrc>>24)&0xFF;
-			transval = 0;
-			resbuf[0] = 0;
-			SI_Transfer(1,cmdbuf,5,resbuf,1,transcb,0);
-			wait_for_transfer();
+			send(fcrc);
 			//get crc back (unused)
-			memset(resbuf,0,32);
-			cmdbuf[0]=0x14; //read
-			transval = 0;
-			SI_Transfer(1,cmdbuf,1,resbuf,5,transcb,0);
-			wait_for_transfer();
+			recv();
 			printf("All done!\n");
 			VIDEO_WaitVSync();
 			VIDEO_WaitVSync();
